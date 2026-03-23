@@ -194,5 +194,4 @@ ISC License
 
 ## Support
 
-For questions or issues, please contact the KOU Racing Team development team.</content>
-<parameter name="filePath">c:\Users\dev\Desktop\kouracing-telemetry\README.md
+For questions or issues, please contact the KOU Racing Team development team.
