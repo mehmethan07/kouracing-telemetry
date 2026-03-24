@@ -1,18 +1,21 @@
 /**
  * KOU Racing Telemetry Gateway
  * Captures UDP packets from the vehicle, sanitizes data, logs system events,
- * writes to InfluxDB, and serves data via Express REST API.
+ * persists to InfluxDB, broadcasts via WebSockets, and serves a rate-limited REST API.
  */
 
 const express = require('express');
 const cors = require('cors');
 const dgram = require('dgram');
 const { InfluxDB, Point } = require('@influxdata/influxdb-client');
+const http = require('http');
+const { Server } = require('socket.io');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
-// IMPORTANT: Use environment variables in production (e.g., process.env.INFLUX_TOKEN)
-const INFLUX_TOKEN = process.env.INFLUX_TOKEN;const INFLUX_ORG = 'KOURACING';
+const INFLUX_TOKEN = process.env.INFLUX_TOKEN;
+const INFLUX_ORG = 'KOURACING';
 const INFLUX_BUCKET = 'telemetry_data';
 const INFLUX_URL = 'http://localhost:8086';
 
@@ -23,8 +26,33 @@ const API_PORT = 3001;
 const app = express();
 app.use(cors());
 
+// DDoS Protection: Rate limiting for API endpoints
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100, 
+    message: { error: "Too many requests from this IP. Please try again later." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api/', apiLimiter);
+
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
 const client = new InfluxDB({ url: INFLUX_URL, token: INFLUX_TOKEN });
-const writeApi = client.getWriteApi(INFLUX_ORG, INFLUX_BUCKET, 'ns');
+
+// InfluxDB Write API with Batch Writing Optimization
+const writeApi = client.getWriteApi(INFLUX_ORG, INFLUX_BUCKET, 'ns', {
+    batchSize: 50,
+    flushInterval: 1000,
+    maxBufferLines: 10000,
+});
+
 const queryApi = client.getQueryApi(INFLUX_ORG);
 const udpServer = dgram.createSocket('udp4');
 
@@ -32,8 +60,9 @@ const udpServer = dgram.createSocket('udp4');
 let latestTelemetryCache = {};
 let lastFaultState = false;
 let lastVehicleState = "None";
+let isMotorOverheating = false;
+let isBatteryAnomaly = false;
 
-// Last Known Good (LKG) values for Data Sanitization
 let lastKnownGood = {
     rpm: 0,
     speed: 0,
@@ -42,51 +71,50 @@ let lastKnownGood = {
     throttle: 0
 };
 
-// Initialize system log
+// Log system initialization
 const startEvent = new Point('system_events')
     .tag('event_type', 'System Start')
-    .stringField('description', 'KOU Racing Telemetry Gateway initialized.')
+    .stringField('description', 'Telemetry Gateway, WebSocket, and Security Shield initialized.')
     .stringField('severity', 'Info');
 writeApi.writePoint(startEvent);
-writeApi.flush();
+
+// --- WEBSOCKET EVENT HANDLERS ---
+io.on('connection', (socket) => {
+    console.log(`[WEBSOCKET] Client connected: ${socket.id}`);
+    
+    if (Object.keys(latestTelemetryCache).length !== 0) {
+        socket.emit('telemetry_update', latestTelemetryCache);
+    }
+
+    socket.on('disconnect', () => {
+        console.log(`[WEBSOCKET] Client disconnected: ${socket.id}`);
+    });
+});
 
 // --- UDP DATA INGESTION & PROCESSING ---
 udpServer.on('message', (msg) => {
     try {
         const data = JSON.parse(msg.toString());
 
-        // 1. DATA SANITIZATION (Outlier Rejection)
-        // Ensure sensor values are within physical physical bounds. Fallback to LKG if anomalous.
-        if (data.rpm < 0 || data.rpm > 15000) {
-            console.warn(`[SANITIZATION] Outlier detected. RPM: ${data.rpm}. Falling back to ${lastKnownGood.rpm}`);
-            data.rpm = lastKnownGood.rpm;
-        } else {
-            lastKnownGood.rpm = data.rpm;
-        }
+        // 1. DATA SANITIZATION
+        if (data.rpm < 0 || data.rpm > 15000) data.rpm = lastKnownGood.rpm;
+        else lastKnownGood.rpm = data.rpm;
 
-        if (data.speed < 0 || data.speed > 160) {
-            console.warn(`[SANITIZATION] Outlier detected. Speed: ${data.speed}. Falling back to ${lastKnownGood.speed}`);
-            data.speed = lastKnownGood.speed;
-        } else {
-            lastKnownGood.speed = data.speed;
-        }
+        if (data.speed < 0 || data.speed > 160) data.speed = lastKnownGood.speed;
+        else lastKnownGood.speed = data.speed;
 
-        if (data.motor_temp < -10 || data.motor_temp > 150) {
-            data.motor_temp = lastKnownGood.motor_temp;
-        } else {
-            lastKnownGood.motor_temp = data.motor_temp;
-        }
+        if (data.motor_temp < -10 || data.motor_temp > 150) data.motor_temp = lastKnownGood.motor_temp;
+        else lastKnownGood.motor_temp = data.motor_temp;
 
-        if (data.throttle < 0 || data.throttle > 1) {
-            data.throttle = lastKnownGood.throttle;
-        } else {
-            lastKnownGood.throttle = data.throttle;
-        }
+        if (data.throttle < 0 || data.throttle > 1) data.throttle = lastKnownGood.throttle;
+        else lastKnownGood.throttle = data.throttle;
 
-        // Update cache for API serving
         latestTelemetryCache = data;
 
-        // 2. PERSIST TELEMETRY DATA
+        // 2. REAL-TIME BROADCAST
+        io.emit('telemetry_update', data);
+
+        // 3. PERSIST TELEMETRY DATA
         const telemetryPoint = new Point('telemetry')
             .floatField('rpm', data.rpm)
             .floatField('speed', data.speed)
@@ -101,7 +129,7 @@ udpServer.on('message', (msg) => {
             .stringField('fault_severity', data.fault_severity);
         writeApi.writePoint(telemetryPoint);
 
-        // 3. EVENT ENGINE (State Change & Fault Detection)
+        // 4. EVENT ENGINE
         if (data.fault === true && lastFaultState === false) {
             const faultEvent = new Point('system_events')
                 .tag('event_type', 'Fault Occurred')
@@ -109,6 +137,8 @@ udpServer.on('message', (msg) => {
                 .stringField('severity', data.fault_severity);
             writeApi.writePoint(faultEvent);
             console.log(`[ALERT] Fault Initiated: ${data.fault_type}`);
+            
+            io.emit('critical_alarm', { type: data.fault_type, timestamp: new Date() });
         } 
         else if (data.fault === false && lastFaultState === true) {
             const resolveEvent = new Point('system_events')
@@ -116,7 +146,7 @@ udpServer.on('message', (msg) => {
                 .stringField('description', 'System normalized. Fault cleared.')
                 .stringField('severity', 'Info');
             writeApi.writePoint(resolveEvent);
-            console.log(`[INFO] System normalized.`);
+            console.log(`[INFO] System normalized. Fault cleared.`);
         }
         lastFaultState = data.fault;
 
@@ -130,11 +160,35 @@ udpServer.on('message', (msg) => {
         }
         lastVehicleState = data.vehicle_state;
 
-        // Force write to ensure <1s latency for Grafana
-        writeApi.flush();
+        // 5. MOTOR AND BATTERY ANOMALY DETECTION (DOĞRU YER)
+        if (data.motor_temp > 100 && !isMotorOverheating) {
+            const tempEvent = new Point('system_events')
+                .tag('event_type', 'Threshold Alert')
+                .stringField('description', `WARNING: Motor overheating! Temp: ${data.motor_temp}°C`)
+                .stringField('severity', 'Warning');
+            writeApi.writePoint(tempEvent);
+            io.emit('critical_alarm', { type: 'MOTOR_OVERHEAT', value: data.motor_temp, timestamp: new Date() });
+            isMotorOverheating = true;
+            console.log(`[ALERT] Motor overheating detected: ${data.motor_temp}°C`);
+        } else if (data.motor_temp <= 100 && isMotorOverheating) {
+            isMotorOverheating = false;
+        }
+
+        if ((data.battery_voltage < 300 || data.battery_voltage > 420) && !isBatteryAnomaly) {
+            const batteryEvent = new Point('system_events')
+                .tag('event_type', 'Threshold Alert')
+                .stringField('description', `WARNING: Battery voltage anomaly! Voltage: ${data.battery_voltage}V`)
+                .stringField('severity', 'Critical');
+            writeApi.writePoint(batteryEvent);
+            io.emit('critical_alarm', { type: 'BATTERY_ANOMALY', value: data.battery_voltage, timestamp: new Date() });
+            isBatteryAnomaly = true;
+            console.log(`[ALERT] Battery anomaly detected: ${data.battery_voltage}V`);
+        } else if (data.battery_voltage >= 300 && data.battery_voltage <= 420 && isBatteryAnomaly) {
+            isBatteryAnomaly = false;
+        }
 
     } catch (error) {
-        console.error("[GATEWAY ERROR] Malformed payload received. Packet dropped.", error.message);
+        console.error("[GATEWAY ERROR] Malformed payload received. Packet dropped.", error);
     }
 });
 
@@ -144,7 +198,6 @@ udpServer.on('listening', () => {
 
 // --- REST API ENDPOINTS ---
 
-// GET: Fetch the most recent telemetry frame
 app.get('/api/telemetry/latest', (req, res) => {
     if (Object.keys(latestTelemetryCache).length === 0) {
         return res.status(404).json({ message: "No telemetry data available." });
@@ -152,19 +205,17 @@ app.get('/api/telemetry/latest', (req, res) => {
     res.json(latestTelemetryCache);
 });
 
-// GET: System health status
 app.get('/api/status', (req, res) => {
     res.json({ 
         status: "operational", 
         gateway_memory_ok: true,
-        last_vehicle_state: lastVehicleState
+        last_vehicle_state: lastVehicleState,
+        active_websocket_connections: io.engine.clientsCount
     });
 });
 
-// GET: Fetch historical telemetry data
 app.get('/api/telemetry/history', (req, res) => {
     const minutes = req.query.minutes || 5; 
-    
     const fluxQuery = `
         from(bucket: "${INFLUX_BUCKET}")
             |> range(start: -${minutes}m)
@@ -174,24 +225,45 @@ app.get('/api/telemetry/history', (req, res) => {
     `;
 
     const resultRows = [];
-
     queryApi.queryRows(fluxQuery, {
-        next: (row, tableMeta) => {
-            resultRows.push(tableMeta.toObject(row));
-        },
-        error: (error) => {
-            console.error('[API ERROR] Failed to fetch historical data:', error);
-            res.status(500).json({ error: "Failed to retrieve historical data." });
-        },
-        complete: () => {
-            res.json(resultRows);
-        }
+        next: (row, tableMeta) => resultRows.push(tableMeta.toObject(row)),
+        error: (error) => res.status(500).json({ error: "Failed to retrieve historical data." }),
+        complete: () => res.json(resultRows)
     });
 });
 
-// Start services
-app.listen(API_PORT, () => {
-    console.log(`[API] REST Server active on port ${API_PORT}`);
+app.get('/api/events', (req, res) => {
+    const hours = req.query.hours || 24; 
+    const fluxQuery = `
+        from(bucket: "${INFLUX_BUCKET}")
+            |> range(start: -${hours}h)
+            |> filter(fn: (r) => r["_measurement"] == "system_events")
+            |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+            |> drop(columns: ["_start", "_stop", "_measurement"])
+            |> sort(columns: ["_time"], desc: true)
+    `;
+
+    const resultRows = [];
+    queryApi.queryRows(fluxQuery, {
+        next: (row, tableMeta) => resultRows.push(tableMeta.toObject(row)),
+        error: (error) => res.status(500).json({ error: "Failed to retrieve system events and faults." }),
+        complete: () => res.json(resultRows)
+    });
+});
+
+process.on('SIGINT', async () => {
+    console.log('\n[SYSTEM] Shutting down gracefully...');
+    try {
+        await writeApi.close();
+        console.log('[SYSTEM] InfluxDB write buffer flushed.');
+    } catch (e) {
+        console.error('[SYSTEM] Error closing InfluxDB connection:', e);
+    }
+    process.exit(0);
+});
+
+httpServer.listen(API_PORT, () => {
+    console.log(`[API] REST and WebSocket Server active on port ${API_PORT}`);
 });
 
 udpServer.bind(UDP_PORT);
