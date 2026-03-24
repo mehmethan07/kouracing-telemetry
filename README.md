@@ -4,13 +4,19 @@ A comprehensive telemetry system for Formula Student Electric vehicles developed
 
 ## Features
 
-- **UDP Data Ingestion**: Receives telemetry packets from vehicles at 5000 port
-- **Data Sanitization**: Outlier rejection with Last Known Good (LKG) fallback values
-- **Time-Series Storage**: InfluxDB integration for high-performance data persistence
-- **Event Logging**: Automatic detection and logging of system faults and state changes
-- **REST API**: HTTP endpoints for real-time and historical telemetry data
-- **Fault Detection**: Real-time monitoring and alerting for critical system issues
-- **Simulator**: Built-in telemetry simulator for testing and development
+- **UDP Data Ingestion**: Receives telemetry packets from vehicles on UDP port 5000
+- **Data Sanitization**: Outlier rejection with Last Known Good (LKG) fallback for RPM, speed, motor_temp, battery_voltage, throttle
+- **In-Memory Cache**: Serves latest telemetry instantly from memory at `/api/telemetry/latest`
+- **Time-Series Storage**: InfluxDB integration with nanosecond precision writes (`telemetry` measurement)
+- **Event Logging**: `system_events` measurement for startup, state transitions, faults and resolutions
+- **State Machine**: tracks `vehicle_state` transitions and logs change events
+- **REST API**: Endpoints for latest, historical, and status queries
+- **Fault Detection**: Detects fault start, resolution, and logs `fault_type`/`fault_severity`
+- **Simulator**: Realistic telemetry generator with dynamic normal/fault scenarios
+- **Low Latency**: periodic `writeApi.flush()` ensures sub-second persistence for dashboards
+- **Security & Rate Limiting**: API routes protected with `express-rate-limit` (max 100 requests per 15 minutes per IP, DDoS mitigation)
+- **Advanced Anomaly Detection**: Motor overheat (motor_temp > 100°C) and battery voltage out-of-bounds (<300V or >420V) events are self-detected and logged
+- **Batch Writing Optimization**: InfluxDB writes are buffered in 50-point batches with 1-second flush interval for performance
 
 ## Architecture
 
@@ -22,7 +28,7 @@ Vehicle → UDP (5000) → Gateway → InfluxDB
 
 ## Prerequisites
 
-- Node.js (v14 or higher)
+- Node.js (v18 or higher)
 - InfluxDB 2.x running on localhost:8086
 - InfluxDB token with write permissions
 
@@ -63,18 +69,39 @@ The gateway will start:
 
 ### Testing with Simulator
 
+The simulator sends UDP telemetry to the gateway every second. It randomly injects faults (≈15% probability) and varies:
+- `Motor Overheating` (high motor_temp)
+- `Battery Anomaly` (low battery_voltage)
+- `Inverter Failure` (inverter_status set to Fault)
+
 In a separate terminal, run the simulator:
 
 ```bash
 node simulator.js
 ```
 
-This will generate realistic telemetry data every second, including occasional faults for testing.
+When running, log output shows the telemetry target and packet status.
 
 ## API Endpoints
 
+### Telemetry payload schema
+All inbound UDP telemetry payloads and API output share the same structure. Required fields:
+
+- `rpm` (number)
+- `speed` (number)
+- `motor_temp` (number)
+- `battery_voltage` (number)
+- `throttle` (number 0.0-1.0)
+- `vehicle_state` (string)
+- `inverter_status` (string)
+- `battery_status` (string)
+- `fault` (boolean)
+- `fault_type` (string)
+- `fault_severity` (string)
+- `fault_timestamp` (ISO 8601 string|null)
+
 ### GET /api/telemetry/latest
-Returns the most recent telemetry frame.
+Returns the most recent telemetry frame (cached from UDP ingestion).
 
 **Response:**
 ```json
@@ -89,7 +116,8 @@ Returns the most recent telemetry frame.
   "battery_status": "Normal",
   "fault": false,
   "fault_type": "None",
-  "fault_severity": "None"
+  "fault_severity": "None",
+  "fault_timestamp": null
 }
 ```
 
@@ -99,6 +127,30 @@ Returns historical telemetry data for the specified time range (default: 5 minut
 **Query Parameters:**
 - `minutes` (optional): Number of minutes of history to retrieve
 
+### GET /api/events?hours=24
+Returns system events and fault history for the requested period (default: 24 hours).
+
+**Query Parameters:**
+- `hours` (optional): Number of hours back to retrieve system_events
+
+**Response:**
+```json
+[
+  {
+    "_time": "2026-03-24T08:23:45Z",
+    "event_type": "Fault Occurred",
+    "description": "CRITICAL FAULT: Inverter Failure detected.",
+    "severity": "Critical"
+  },
+  {
+    "_time": "2026-03-24T08:20:11Z",
+    "event_type": "Threshold Alert",
+    "description": "WARNING: Motor overheating! Temp: 107.4°C",
+    "severity": "Warning"
+  }
+]
+```
+
 ### GET /api/status
 Returns system health status.
 
@@ -107,7 +159,8 @@ Returns system health status.
 {
   "status": "operational",
   "gateway_memory_ok": true,
-  "last_vehicle_state": "Drive"
+  "last_vehicle_state": "Drive",
+  "active_websocket_connections": 3
 }
 ```
 
