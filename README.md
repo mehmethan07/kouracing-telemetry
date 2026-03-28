@@ -36,7 +36,7 @@ Vehicle → UDP (5000) → Gateway → InfluxDB
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone < https://github.com/mehmethan07/kouracing-telemetry.git >
 cd kouracing-telemetry
 ```
 
@@ -49,6 +49,15 @@ npm install
 Create a `.env` file in the root directory:
 ```env
 INFLUX_TOKEN=your-influxdb-token-here
+
+# Maximum temperature threshold for motor overheating warning (°C)
+MAX_MOTOR_TEMP=100
+
+# Minimum voltage threshold for battery anomaly warning (V)
+MIN_BATTERY_VOLTAGE=300
+
+# Maximum voltage threshold for battery anomaly warning (V)
+MAX_BATTERY_VOLTAGE=420
 ```
 
 4. Ensure InfluxDB is running and configured with:

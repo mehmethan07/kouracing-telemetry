@@ -22,6 +22,11 @@ const INFLUX_URL = 'http://localhost:8086';
 const UDP_PORT = 5000;
 const API_PORT = 3001;
 
+// Threshold Configurations (with fallbacks)
+const MAX_MOTOR_TEMP = process.env.MAX_MOTOR_TEMP ? parseFloat(process.env.MAX_MOTOR_TEMP) : 100;
+const MIN_BATTERY_VOLTAGE = process.env.MIN_BATTERY_VOLTAGE ? parseFloat(process.env.MIN_BATTERY_VOLTAGE) : 300;
+const MAX_BATTERY_VOLTAGE = process.env.MAX_BATTERY_VOLTAGE ? parseFloat(process.env.MAX_BATTERY_VOLTAGE) : 420;
+
 // --- INITIALIZATION ---
 const app = express();
 app.use(cors());
@@ -63,13 +68,9 @@ let lastVehicleState = "None";
 let isMotorOverheating = false;
 let isBatteryAnomaly = false;
 
-let lastKnownGood = {
-    rpm: 0,
-    speed: 0,
-    motor_temp: 20,
-    battery_voltage: 400,
-    throttle: 0
-};
+let lastSequenceId = -1;
+let lastBroadcastTime = 0;
+const BROADCAST_INTERVAL_MS = 50; // 20Hz max WebSocket broadcast rate
 
 // Log system initialization
 const startEvent = new Point('system_events')
@@ -96,23 +97,50 @@ udpServer.on('message', (msg) => {
     try {
         const data = JSON.parse(msg.toString());
 
-        // 1. DATA SANITIZATION
-        if (data.rpm < 0 || data.rpm > 15000) data.rpm = lastKnownGood.rpm;
-        else lastKnownGood.rpm = data.rpm;
+        // 0. PACKET ORDERING GUARD — drop out-of-order UDP packets
+        if (typeof data.sequence_id === 'number') {
+            if (data.sequence_id <= lastSequenceId) {
+                return; // stale / duplicate packet — silently discard
+            }
+            lastSequenceId = data.sequence_id;
+        }
 
-        if (data.speed < 0 || data.speed > 160) data.speed = lastKnownGood.speed;
-        else lastKnownGood.speed = data.speed;
+        // 1. DATA SANITIZATION — null-out invalid readings, fire SENSOR_FAULT
+        const sensorFaults = [];
+        if (typeof data.rpm !== 'number' || data.rpm < 0 || data.rpm > 15000) {
+            data.rpm = null; sensorFaults.push('rpm');
+        }
+        if (typeof data.speed !== 'number' || data.speed < 0 || data.speed > 160) {
+            data.speed = null; sensorFaults.push('speed');
+        }
+        if (typeof data.motor_temp !== 'number' || data.motor_temp < -10 || data.motor_temp > 150) {
+            data.motor_temp = null; sensorFaults.push('motor_temp');
+        }
+        if (typeof data.battery_voltage !== 'number' || data.battery_voltage < 0 || data.battery_voltage > 500) {
+            data.battery_voltage = null; sensorFaults.push('battery_voltage');
+        }
+        if (typeof data.throttle !== 'number' || data.throttle < 0 || data.throttle > 1) {
+            data.throttle = null; sensorFaults.push('throttle');
+        }
 
-        if (data.motor_temp < -10 || data.motor_temp > 150) data.motor_temp = lastKnownGood.motor_temp;
-        else lastKnownGood.motor_temp = data.motor_temp;
-
-        if (data.throttle < 0 || data.throttle > 1) data.throttle = lastKnownGood.throttle;
-        else lastKnownGood.throttle = data.throttle;
+        if (sensorFaults.length > 0) {
+            const faultPoint = new Point('system_events')
+                .tag('event_type', 'SENSOR_FAULT')
+                .stringField('description', `Sensor fault detected on: ${sensorFaults.join(', ')}`)
+                .stringField('severity', 'Critical');
+            writeApi.writePoint(faultPoint);
+            io.emit('sensor_fault', { fields: sensorFaults, timestamp: new Date() });
+            console.log(`[ALERT] SENSOR_FAULT: ${sensorFaults.join(', ')}`);
+        }
 
         latestTelemetryCache = data;
 
-        // 2. REAL-TIME BROADCAST
-        io.emit('telemetry_update', data);
+        // 2. THROTTLED REAL-TIME BROADCAST (max 20Hz to protect clients)
+        const now = Date.now();
+        if (now - lastBroadcastTime >= BROADCAST_INTERVAL_MS) {
+            io.emit('telemetry_update', data);
+            lastBroadcastTime = now;
+        }
 
         // 3. PERSIST TELEMETRY DATA
         const telemetryPoint = new Point('telemetry')
@@ -160,8 +188,8 @@ udpServer.on('message', (msg) => {
         }
         lastVehicleState = data.vehicle_state;
 
-        // 5. MOTOR AND BATTERY ANOMALY DETECTION (DOĞRU YER)
-        if (data.motor_temp > 100 && !isMotorOverheating) {
+        // 5. MOTOR AND BATTERY ANOMALY DETECTION
+        if (data.motor_temp > MAX_MOTOR_TEMP && !isMotorOverheating) {
             const tempEvent = new Point('system_events')
                 .tag('event_type', 'Threshold Alert')
                 .stringField('description', `WARNING: Motor overheating! Temp: ${data.motor_temp}°C`)
@@ -170,11 +198,11 @@ udpServer.on('message', (msg) => {
             io.emit('critical_alarm', { type: 'MOTOR_OVERHEAT', value: data.motor_temp, timestamp: new Date() });
             isMotorOverheating = true;
             console.log(`[ALERT] Motor overheating detected: ${data.motor_temp}°C`);
-        } else if (data.motor_temp <= 100 && isMotorOverheating) {
+        } else if (data.motor_temp <= MAX_MOTOR_TEMP && isMotorOverheating) {
             isMotorOverheating = false;
         }
 
-        if ((data.battery_voltage < 300 || data.battery_voltage > 420) && !isBatteryAnomaly) {
+        if ((data.battery_voltage < MIN_BATTERY_VOLTAGE || data.battery_voltage > MAX_BATTERY_VOLTAGE) && !isBatteryAnomaly) {
             const batteryEvent = new Point('system_events')
                 .tag('event_type', 'Threshold Alert')
                 .stringField('description', `WARNING: Battery voltage anomaly! Voltage: ${data.battery_voltage}V`)
@@ -183,7 +211,7 @@ udpServer.on('message', (msg) => {
             io.emit('critical_alarm', { type: 'BATTERY_ANOMALY', value: data.battery_voltage, timestamp: new Date() });
             isBatteryAnomaly = true;
             console.log(`[ALERT] Battery anomaly detected: ${data.battery_voltage}V`);
-        } else if (data.battery_voltage >= 300 && data.battery_voltage <= 420 && isBatteryAnomaly) {
+        } else if (data.battery_voltage >= MIN_BATTERY_VOLTAGE && data.battery_voltage <= MAX_BATTERY_VOLTAGE && isBatteryAnomaly) {
             isBatteryAnomaly = false;
         }
 
@@ -215,7 +243,8 @@ app.get('/api/status', (req, res) => {
 });
 
 app.get('/api/telemetry/history', (req, res) => {
-    const minutes = req.query.minutes || 5; 
+    let minutes = parseInt(req.query.minutes, 10);
+    if (isNaN(minutes) || minutes <= 0 || minutes > 1440) minutes = 5;
     const fluxQuery = `
         from(bucket: "${INFLUX_BUCKET}")
             |> range(start: -${minutes}m)
@@ -233,7 +262,8 @@ app.get('/api/telemetry/history', (req, res) => {
 });
 
 app.get('/api/events', (req, res) => {
-    const hours = req.query.hours || 24; 
+    let hours = parseInt(req.query.hours, 10);
+    if (isNaN(hours) || hours <= 0 || hours > 720) hours = 24;
     const fluxQuery = `
         from(bucket: "${INFLUX_BUCKET}")
             |> range(start: -${hours}h)

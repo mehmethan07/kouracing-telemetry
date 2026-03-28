@@ -9,6 +9,7 @@ const client = dgram.createSocket('udp4');
 
 const UDP_PORT = 5000;
 const UDP_HOST = 'localhost';
+let sequenceId = 0;
 
 function generateRandomTelemetry() {
     // 15% probability of a system fault
@@ -35,6 +36,7 @@ function generateRandomTelemetry() {
 
     // Construct telemetry payload
     const payload = {
+        sequence_id: sequenceId++,
         rpm: currentRpm, 
         speed: currentSpeed, 
         motor_temp: motorTemp, 
