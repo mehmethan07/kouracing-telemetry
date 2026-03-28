@@ -5,17 +5,19 @@ A comprehensive telemetry system for Formula Student Electric vehicles developed
 ## Features
 
 - **UDP Data Ingestion**: Receives telemetry packets from vehicles on UDP port 5000
-- **Data Sanitization**: Outlier rejection with Last Known Good (LKG) fallback for RPM, speed, motor_temp, battery_voltage, throttle
+- **Data Sanitization**: Outlier rejection replacing invalid data with `null` and emitting `SENSOR_FAULT` events
+- **Packet Ordering**: Drops out-of-order UDP packets via `sequence_id` tracking to ensure data consistency
 - **In-Memory Cache**: Serves latest telemetry instantly from memory at `/api/telemetry/latest`
 - **Time-Series Storage**: InfluxDB integration with nanosecond precision writes (`telemetry` measurement)
 - **Event Logging**: `system_events` measurement for startup, state transitions, faults and resolutions
 - **State Machine**: tracks `vehicle_state` transitions and logs change events
 - **REST API**: Endpoints for latest, historical, and status queries
+- **WebSocket Broadcaster**: Throttles incoming high-frequency UDP data down to a smooth 20Hz for connected clients
 - **Fault Detection**: Detects fault start, resolution, and logs `fault_type`/`fault_severity`
-- **Simulator**: Realistic telemetry generator with dynamic normal/fault scenarios
+- **Simulator**: Realistic telemetry generator with dynamic normal/fault scenarios and sequence tagging
 - **Low Latency**: periodic `writeApi.flush()` ensures sub-second persistence for dashboards
-- **Security & Rate Limiting**: API routes protected with `express-rate-limit` (max 100 requests per 15 minutes per IP, DDoS mitigation)
-- **Advanced Anomaly Detection**: Motor overheat (motor_temp > 100°C) and battery voltage out-of-bounds (<300V or >420V) events are self-detected and logged
+- **Security & Rate Limiting**: API routes protected with `express-rate-limit` (DDoS mitigation) and strict `parseInt` limits against Flux Injection
+- **Advanced Anomaly Detection**: Motor overheat and battery voltage anomalies are dynamically checked against `.env` thresholds and logged
 - **Batch Writing Optimization**: InfluxDB writes are buffered in 50-point batches with 1-second flush interval for performance
 
 ## Architecture
@@ -46,17 +48,20 @@ npm install
 ```
 
 3. Set up environment variables:
-Create a `.env` file in the root directory:
+Create a `.env` file in the root directory. Only `INFLUX_TOKEN` is required; the threshold variables are optional overrides (defaults are shown below):
 ```env
 INFLUX_TOKEN=your-influxdb-token-here
 
-# Maximum temperature threshold for motor overheating warning (°C)
+# (Optional) Maximum temperature threshold for motor overheating warning (°C)
+# Default: 100
 MAX_MOTOR_TEMP=100
 
-# Minimum voltage threshold for battery anomaly warning (V)
+# (Optional) Minimum voltage threshold for battery anomaly warning (V)
+# Default: 300
 MIN_BATTERY_VOLTAGE=300
 
-# Maximum voltage threshold for battery anomaly warning (V)
+# (Optional) Maximum voltage threshold for battery anomaly warning (V)
+# Default: 420
 MAX_BATTERY_VOLTAGE=420
 ```
 
@@ -96,6 +101,7 @@ When running, log output shows the telemetry target and packet status.
 ### Telemetry payload schema
 All inbound UDP telemetry payloads and API output share the same structure. Required fields:
 
+- `sequence_id` (number)
 - `rpm` (number)
 - `speed` (number)
 - `motor_temp` (number)
@@ -131,16 +137,16 @@ Returns the most recent telemetry frame (cached from UDP ingestion).
 ```
 
 ### GET /api/telemetry/history?minutes=5
-Returns historical telemetry data for the specified time range (default: 5 minutes).
+Returns historical telemetry data for the specified time range.
 
 **Query Parameters:**
-- `minutes` (optional): Number of minutes of history to retrieve
+- `minutes` (optional): Number of minutes of history to retrieve (default: 5, max: 1440)
 
 ### GET /api/events?hours=24
-Returns system events and fault history for the requested period (default: 24 hours).
+Returns system events and fault history for the requested period.
 
 **Query Parameters:**
-- `hours` (optional): Number of hours back to retrieve system_events
+- `hours` (optional): Number of hours back to retrieve system_events (default: 24, max: 720)
 
 **Response:**
 ```json
@@ -182,7 +188,7 @@ The gateway implements robust data validation:
 - **Motor Temperature**: -10°C to 150°C range
 - **Throttle**: 0-1 range
 
-Out-of-bounds values are rejected and replaced with Last Known Good (LKG) values.
+Out-of-bounds values are rejected, set to `null` to prevent "ghost data", and a `SENSOR_FAULT` system event is automatically logged and broadcasted to clients.
 
 ## Event System
 
@@ -244,7 +250,7 @@ Run the simulator alongside the gateway to test:
 
 ## License
 
-ISC License
+MIT License
 
 ## Contributing
 
