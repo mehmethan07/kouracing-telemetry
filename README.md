@@ -1,265 +1,123 @@
 # KOU Racing Telemetry Gateway
 
-A comprehensive telemetry system for Formula Student Electric vehicles developed by Kocaeli University Racing Team. This gateway captures real-time vehicle data via UDP, sanitizes it for reliability, stores it in InfluxDB for time-series analysis, and provides REST API endpoints for data access.
+A robust, real-time telemetry gateway designed for Formula Student Electric vehicles. This system securely captures high-frequency UDP vehicle data, performs advanced sanitization, and persists normalized time-series data to InfluxDB. It features a scalable REST API and a throttled WebSocket broadcaster optimized for low-latency dashboards.
 
 ## Features
 
-- **UDP Data Ingestion**: Receives telemetry packets from vehicles on UDP port 5000
-- **Data Sanitization**: Outlier rejection replacing invalid data with `null` and emitting `SENSOR_FAULT` events
-- **Packet Ordering**: Drops out-of-order UDP packets via `sequence_id` tracking to ensure data consistency
-- **In-Memory Cache**: Serves latest telemetry instantly from memory at `/api/telemetry/latest`
-- **Time-Series Storage**: InfluxDB integration with nanosecond precision writes (`telemetry` measurement)
-- **Event Logging**: `system_events` measurement for startup, state transitions, faults and resolutions
-- **State Machine**: tracks `vehicle_state` transitions and logs change events
-- **REST API**: Endpoints for latest, historical, and status queries
-- **WebSocket Broadcaster**: Throttles incoming high-frequency UDP data down to a smooth 20Hz for connected clients
-- **Fault Detection**: Detects fault start, resolution, and logs `fault_type`/`fault_severity`
-- **Simulator**: Realistic telemetry generator with dynamic normal/fault scenarios and sequence tagging
-- **Low Latency**: periodic `writeApi.flush()` ensures sub-second persistence for dashboards
-- **Security & Rate Limiting**: API routes protected with `express-rate-limit` (DDoS mitigation) and strict `parseInt` limits against Flux Injection
-- **Advanced Anomaly Detection**: Motor overheat and battery voltage anomalies are dynamically checked against `.env` thresholds and logged
-- **Batch Writing Optimization**: InfluxDB writes are buffered in 50-point batches with 1-second flush interval for performance
+- **UDP Data Ingestion**: High-throughput receiver capturing raw vehicle telemetry on UDP port 5000.
+- **Data Sanitization & Validation**: Outlier rejection mapping invalid sensor data to `null` while emitting asynchronous `SENSOR_FAULT` events.
+- **Packet Ordering Enforcement**: Drops out-of-order UDP packets via strict `sequence_id` tracking, ensuring time-series monotonicity.
+- **Time-Series Persistence**: Integrated with InfluxDB via batch writing (50-point buffer, 1s interval) for nanosecond-precision state storage.
+- **Throttled WebSocket Broadcaster**: Downsamples high-frequency incoming telemetry to a smooth 20Hz stream, optimizing connected client performance.
+- **State Machine Logging**: Tracks `vehicle_state` transitions, system startup, and dynamically writes fault occurrences/resolutions into an InfluxDB `system_events` measurement.
+- **Advanced Anomaly Detection**: Real-time evaluation of motor temperature and battery voltage against environment-defined thresholds.
+- **Security & DDoS Mitigation**: REST APIs protected by `express-rate-limit` with strict parameter enforcement to prevent Flux Injection.
+- **In-Memory Caching**: Rapid O(1) retrieval of the latest normalized telemetry frame via the `/api/telemetry/latest` endpoint.
 
 ## Architecture
 
-```
-Vehicle → UDP (5000) → Gateway → InfluxDB
-                    ↓
-               REST API (3001) → Clients (Grafana, Dashboard, etc.)
-```
-
-## Prerequisites
-
-- Node.js (v18 or higher)
-- InfluxDB 2.x running on localhost:8086
-- InfluxDB token with write permissions
-
-## Installation
-
-1. Clone the repository:
-```bash
-git clone < https://github.com/mehmethan07/kouracing-telemetry.git >
-cd kouracing-telemetry
+```text
+Vehicle (Telemetry Unit)
+        │ (UDP 5000)
+        ▼
+Telemetry Gateway ──(Batch Write)──> InfluxDB
+        │
+        ├─(REST API 3001)─> Historical Analysis (Grafana)
+        └─(WebSocket)─────> Real-Time Dashboard
 ```
 
-2. Install dependencies:
-```bash
-npm install
-```
+## Setup & Deployment
 
-3. Set up environment variables:
-Create a `.env` file in the root directory. Only `INFLUX_TOKEN` is required; the threshold variables are optional overrides (defaults are shown below):
-```env
+### Prerequisites
+
+- **Environment**: Node.js v18 or later.
+- **Database**: InfluxDB v2.x (running locally or within a container network).
+- **Hardware Profile**: Fully compatible with ARM64/x64 architectures, including native optimization for Raspberry Pi 5 deployments.
+
+### 1. Environment Configuration
+
+Create a `.env` file in the project root. Only `INFLUX_TOKEN` is mandatory; all other values retain fail-safe defaults.
+
+```dotenv
 INFLUX_TOKEN=your-influxdb-token-here
 
-# (Optional) Maximum temperature threshold for motor overheating warning (°C)
-# Default: 100
+# Database Routing 
+# -> Default is 'http://influxdb:8086' for docker networks
+# -> Override to 'http://localhost:8086' or Docker Host IP if running bare-metal
+INFLUX_URL=http://localhost:8086
+INFLUX_ORG=your-org-name
+INFLUX_BUCKET=your-bucket-name
+
+# Safety Thresholds (Configurable)
 MAX_MOTOR_TEMP=100
-
-# (Optional) Minimum voltage threshold for battery anomaly warning (V)
-# Default: 300
 MIN_BATTERY_VOLTAGE=300
-
-# (Optional) Maximum voltage threshold for battery anomaly warning (V)
-# Default: 420
 MAX_BATTERY_VOLTAGE=420
 ```
 
-4. Ensure InfluxDB is running and configured with:
-- Organization: `KOURACING`
-- Bucket: `telemetry_data`
+### 2. Standard Deployment (Bare-Metal)
 
-## Usage
-
-### Starting the Gateway
+For direct host installations:
 
 ```bash
+git clone https://github.com/mehmethan07/kouracing-telemetry.git
+cd kouracing-telemetry
+npm install
 node index.js
 ```
 
-The gateway will start:
-- UDP listener on port 5000
-- REST API server on port 3001
+### 3. Containerized Deployment (Recommended for Raspberry Pi 5)
 
-### Testing with Simulator
+The included `Dockerfile` leverages an `alpine` image optimized for ARM64 edge runtime performance. 
 
-The simulator sends UDP telemetry to the gateway every second. It randomly injects faults (≈15% probability) and varies:
-- `Motor Overheating` (high motor_temp)
-- `Battery Anomaly` (low battery_voltage)
-- `Inverter Failure` (inverter_status set to Fault)
+Build and run the container:
 
-In a separate terminal, run the simulator:
+```bash
+docker build -t kouracing-telemetry .
+
+docker run -d \
+  --name telemetry-gateway \
+  --env-file .env \
+  -p 5000:5000/udp \
+  -p 3001:3001 \
+  kouracing-telemetry
+```
+*(Note: If InfluxDB is running on the host machine, ensure `INFLUX_URL` in your `.env` points to the host's bridge IP rather than `localhost`, as `localhost` inside the container resolves to the container itself).*
+
+## API Reference
+
+### Telemetry Schema
+All incoming UDP packets, API responses, and WebSocket payloads conform strictly to the following structure:
+
+- `sequence_id` (Number)
+- `rpm` (Number: 0-15000)
+- `speed` (Number: 0-160)
+- `motor_temp` (Number: -10 to 150)
+- `battery_voltage` (Number: 0-500)
+- `throttle` (Number: 0.0-1.0 incoming UDP -> 0-100 normalized outbound)
+- `vehicle_state` (String)
+- `inverter_status` (String)
+- `battery_status` (String)
+- `fault` (Boolean)
+- `fault_type` (String)
+- `fault_severity` (String)
+- `fault_timestamp` (ISO 8601 String or null)
+
+### Endpoints
+- **`GET /api/telemetry/latest`**: Yields the most recent state frame from memory.
+- **`GET /api/telemetry/history?minutes=5`**: Yields historical `telemetry` timeseries arrays.
+- **`GET /api/events?hours=24`**: Yields system state changes and critical fault records.
+- **`GET /api/status`**: Gateway operational status, WebSocket load, and active memory checks.
+
+## Simulator & Testing
+
+The repository provides an isolated data generator (`simulator.js`) which broadcasts arbitrary UDP telemetry to port 5000. It deterministically injects failure states (motor overheating, inverter faults) for validation.
 
 ```bash
 node simulator.js
 ```
 
-When running, log output shows the telemetry target and packet status.
-
-## API Endpoints
-
-### Telemetry payload schema
-All inbound UDP telemetry payloads and API output share the same structure. Required fields:
-
-- `sequence_id` (number)
-- `rpm` (number)
-- `speed` (number)
-- `motor_temp` (number)
-- `battery_voltage` (number)
-- `throttle` (number 0.0-1.0)
-- `vehicle_state` (string)
-- `inverter_status` (string)
-- `battery_status` (string)
-- `fault` (boolean)
-- `fault_type` (string)
-- `fault_severity` (string)
-- `fault_timestamp` (ISO 8601 string|null)
-
-### GET /api/telemetry/latest
-Returns the most recent telemetry frame (cached from UDP ingestion).
-
-**Response:**
-```json
-{
-  "rpm": 8500,
-  "speed": 45,
-  "motor_temp": 65.2,
-  "battery_voltage": 378.5,
-  "throttle": 0.75,
-  "vehicle_state": "Drive",
-  "inverter_status": "Active",
-  "battery_status": "Normal",
-  "fault": false,
-  "fault_type": "None",
-  "fault_severity": "None",
-  "fault_timestamp": null
-}
-```
-
-### GET /api/telemetry/history?minutes=5
-Returns historical telemetry data for the specified time range.
-
-**Query Parameters:**
-- `minutes` (optional): Number of minutes of history to retrieve (default: 5, max: 1440)
-
-### GET /api/events?hours=24
-Returns system events and fault history for the requested period.
-
-**Query Parameters:**
-- `hours` (optional): Number of hours back to retrieve system_events (default: 24, max: 720)
-
-**Response:**
-```json
-[
-  {
-    "_time": "2026-03-24T08:23:45Z",
-    "event_type": "Fault Occurred",
-    "description": "CRITICAL FAULT: Inverter Failure detected.",
-    "severity": "Critical"
-  },
-  {
-    "_time": "2026-03-24T08:20:11Z",
-    "event_type": "Threshold Alert",
-    "description": "WARNING: Motor overheating! Temp: 107.4°C",
-    "severity": "Warning"
-  }
-]
-```
-
-### GET /api/status
-Returns system health status.
-
-**Response:**
-```json
-{
-  "status": "operational",
-  "gateway_memory_ok": true,
-  "last_vehicle_state": "Drive",
-  "active_websocket_connections": 3
-}
-```
-
-## Data Sanitization
-
-The gateway implements robust data validation:
-
-- **RPM**: 0-15000 range
-- **Speed**: 0-160 km/h range
-- **Motor Temperature**: -10°C to 150°C range
-- **Throttle**: 0-1 range
-
-Out-of-bounds values are rejected, set to `null` to prevent "ghost data", and a `SENSOR_FAULT` system event is automatically logged and broadcasted to clients.
-
-## Event System
-
-Automatic event detection and logging:
-
-- **System Start/Stop**: Gateway initialization events
-- **Fault Detection**: Critical fault alerts with severity levels
-- **Fault Resolution**: Recovery event logging
-- **State Changes**: Vehicle state transitions
-
-## Configuration
-
-Key configuration parameters in `index.js`:
-
-```javascript
-const INFLUX_TOKEN = process.env.INFLUX_TOKEN;
-const INFLUX_ORG = 'KOURACING';
-const INFLUX_BUCKET = 'telemetry_data';
-const INFLUX_URL = 'http://localhost:8086';
-
-const UDP_PORT = 5000;
-const API_PORT = 3001;
-```
-
-## Monitoring & Visualization
-
-The telemetry data is optimized for integration with:
-
-- **Grafana**: Real-time dashboards and historical analysis
-- **InfluxDB UI**: Direct database queries and visualization
-- **Custom Dashboards**: REST API integration for web/mobile apps
-
-## Development
-
-### Project Structure
-
-```
-kouracing-telemetry/
-├── index.js          # Main gateway application
-├── simulator.js      # Telemetry data simulator
-├── package.json      # Dependencies and scripts
-└── README.md         # This file
-```
-
-### Adding New Telemetry Fields
-
-1. Update the UDP message parsing in `index.js`
-2. Add sanitization logic if needed
-3. Include the field in the InfluxDB Point creation
-4. Update API responses
-
-### Testing
-
-Run the simulator alongside the gateway to test:
-- Data ingestion and sanitization
-- Fault detection and event logging
-- API endpoint functionality
-- InfluxDB data persistence
-
-## License
-
-MIT License
-
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly with the simulator
-5. Submit a pull request
+Architectural enhancements, integration protocols, and testing optimizations are welcome. When extending the telemetry schema, ensure new properties are explicitly implemented in the sanitization pipeline mapped within `index.js`.
 
-## Support
-
-For questions or issues, please contact the KOU Racing Team development team.
+**License**: MIT

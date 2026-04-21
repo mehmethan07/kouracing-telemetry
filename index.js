@@ -15,9 +15,9 @@ require('dotenv').config();
 
 // --- CONFIGURATION ---
 const INFLUX_TOKEN = process.env.INFLUX_TOKEN;
-const INFLUX_ORG = 'KOURACING';
-const INFLUX_BUCKET = 'telemetry_data';
-const INFLUX_URL = 'http://localhost:8086';
+const INFLUX_ORG = process.env.INFLUX_ORG || 'telemetry_org';
+const INFLUX_BUCKET = process.env.INFLUX_BUCKET || 'telemetry_data';
+const INFLUX_URL = process.env.INFLUX_URL || 'http://influxdb:8086';
 
 const UDP_PORT = 5000;
 const API_PORT = 3001;
@@ -99,7 +99,9 @@ udpServer.on('message', (msg) => {
 
         // 0. PACKET ORDERING GUARD — drop out-of-order UDP packets
         if (typeof data.sequence_id === 'number') {
-            if (data.sequence_id <= lastSequenceId) {
+            // Allow reset if sequence ID drops significantly (device rebooted)
+            // If the drop is less than 50 packets (2.5 seconds at 20Hz), it is likely a stale packet
+            if (data.sequence_id <= lastSequenceId && (lastSequenceId - data.sequence_id < 50)) {
                 return; // stale / duplicate packet — silently discard
             }
             lastSequenceId = data.sequence_id;
@@ -121,6 +123,9 @@ udpServer.on('message', (msg) => {
         }
         if (typeof data.throttle !== 'number' || data.throttle < 0 || data.throttle > 1) {
             data.throttle = null; sensorFaults.push('throttle');
+        } else {
+            // Normalize 0-1 → 0-100 for dashboard compatibility
+            data.throttle = Math.round(data.throttle * 100 * 10) / 10;
         }
 
         if (sensorFaults.length > 0) {
@@ -143,18 +148,19 @@ udpServer.on('message', (msg) => {
         }
 
         // 3. PERSIST TELEMETRY DATA
-        const telemetryPoint = new Point('telemetry')
-            .floatField('rpm', data.rpm)
-            .floatField('speed', data.speed)
-            .floatField('motor_temp', data.motor_temp)
-            .floatField('battery_voltage', data.battery_voltage)
-            .floatField('throttle', data.throttle)
-            .stringField('vehicle_state', data.vehicle_state)
-            .stringField('inverter_status', data.inverter_status)
-            .stringField('battery_status', data.battery_status)
-            .booleanField('fault', data.fault)
-            .stringField('fault_type', data.fault_type)
-            .stringField('fault_severity', data.fault_severity);
+        // Only write non-null sensor fields to preserve data integrity
+        const telemetryPoint = new Point('telemetry');
+        if (data.rpm !== null) telemetryPoint.floatField('rpm', data.rpm);
+        if (data.speed !== null) telemetryPoint.floatField('speed', data.speed);
+        if (data.motor_temp !== null) telemetryPoint.floatField('motor_temp', data.motor_temp);
+        if (data.battery_voltage !== null) telemetryPoint.floatField('battery_voltage', data.battery_voltage);
+        if (data.throttle !== null) telemetryPoint.floatField('throttle', data.throttle);
+        if (data.vehicle_state) telemetryPoint.stringField('vehicle_state', data.vehicle_state);
+        if (data.inverter_status) telemetryPoint.stringField('inverter_status', data.inverter_status);
+        if (data.battery_status) telemetryPoint.stringField('battery_status', data.battery_status);
+        telemetryPoint.booleanField('fault', !!data.fault);
+        if (data.fault_type) telemetryPoint.stringField('fault_type', data.fault_type);
+        if (data.fault_severity) telemetryPoint.stringField('fault_severity', data.fault_severity);
         writeApi.writePoint(telemetryPoint);
 
         // 4. EVENT ENGINE
@@ -189,30 +195,48 @@ udpServer.on('message', (msg) => {
         lastVehicleState = data.vehicle_state;
 
         // 5. MOTOR AND BATTERY ANOMALY DETECTION
-        if (data.motor_temp > MAX_MOTOR_TEMP && !isMotorOverheating) {
-            const tempEvent = new Point('system_events')
-                .tag('event_type', 'Threshold Alert')
-                .stringField('description', `WARNING: Motor overheating! Temp: ${data.motor_temp}°C`)
-                .stringField('severity', 'Warning');
-            writeApi.writePoint(tempEvent);
-            io.emit('critical_alarm', { type: 'MOTOR_OVERHEAT', value: data.motor_temp, timestamp: new Date() });
-            isMotorOverheating = true;
-            console.log(`[ALERT] Motor overheating detected: ${data.motor_temp}°C`);
-        } else if (data.motor_temp <= MAX_MOTOR_TEMP && isMotorOverheating) {
-            isMotorOverheating = false;
+        if (data.motor_temp !== null) {
+            if (data.motor_temp > MAX_MOTOR_TEMP && !isMotorOverheating) {
+                const tempEvent = new Point('system_events')
+                    .tag('event_type', 'Threshold Alert')
+                    .stringField('description', `WARNING: Motor overheating! Temp: ${data.motor_temp}°C`)
+                    .stringField('severity', 'Warning');
+                writeApi.writePoint(tempEvent);
+                io.emit('critical_alarm', { type: 'MOTOR_OVERHEAT', value: data.motor_temp, timestamp: new Date() });
+                isMotorOverheating = true;
+                console.log(`[ALERT] Motor overheating detected: ${data.motor_temp}°C`);
+            } else if (data.motor_temp <= MAX_MOTOR_TEMP && isMotorOverheating) {
+                const tempEvent = new Point('system_events')
+                    .tag('event_type', 'Threshold Resolved')
+                    .stringField('description', `Motor temperature normalized: ${data.motor_temp}°C`)
+                    .stringField('severity', 'Info');
+                writeApi.writePoint(tempEvent);
+                io.emit('alarm_resolved', { type: 'MOTOR_OVERHEAT', timestamp: new Date() });
+                isMotorOverheating = false;
+                console.log(`[INFO] Motor temperature normalized: ${data.motor_temp}°C`);
+            }
         }
 
-        if ((data.battery_voltage < MIN_BATTERY_VOLTAGE || data.battery_voltage > MAX_BATTERY_VOLTAGE) && !isBatteryAnomaly) {
-            const batteryEvent = new Point('system_events')
-                .tag('event_type', 'Threshold Alert')
-                .stringField('description', `WARNING: Battery voltage anomaly! Voltage: ${data.battery_voltage}V`)
-                .stringField('severity', 'Critical');
-            writeApi.writePoint(batteryEvent);
-            io.emit('critical_alarm', { type: 'BATTERY_ANOMALY', value: data.battery_voltage, timestamp: new Date() });
-            isBatteryAnomaly = true;
-            console.log(`[ALERT] Battery anomaly detected: ${data.battery_voltage}V`);
-        } else if (data.battery_voltage >= MIN_BATTERY_VOLTAGE && data.battery_voltage <= MAX_BATTERY_VOLTAGE && isBatteryAnomaly) {
-            isBatteryAnomaly = false;
+        if (data.battery_voltage !== null) {
+            if ((data.battery_voltage < MIN_BATTERY_VOLTAGE || data.battery_voltage > MAX_BATTERY_VOLTAGE) && !isBatteryAnomaly) {
+                const batteryEvent = new Point('system_events')
+                    .tag('event_type', 'Threshold Alert')
+                    .stringField('description', `WARNING: Battery voltage anomaly! Voltage: ${data.battery_voltage}V`)
+                    .stringField('severity', 'Critical');
+                writeApi.writePoint(batteryEvent);
+                io.emit('critical_alarm', { type: 'BATTERY_ANOMALY', value: data.battery_voltage, timestamp: new Date() });
+                isBatteryAnomaly = true;
+                console.log(`[ALERT] Battery anomaly detected: ${data.battery_voltage}V`);
+            } else if (data.battery_voltage >= MIN_BATTERY_VOLTAGE && data.battery_voltage <= MAX_BATTERY_VOLTAGE && isBatteryAnomaly) {
+                const batteryEvent = new Point('system_events')
+                    .tag('event_type', 'Threshold Resolved')
+                    .stringField('description', `Battery voltage normalized: ${data.battery_voltage}V`)
+                    .stringField('severity', 'Info');
+                writeApi.writePoint(batteryEvent);
+                io.emit('alarm_resolved', { type: 'BATTERY_ANOMALY', timestamp: new Date() });
+                isBatteryAnomaly = false;
+                console.log(`[INFO] Battery voltage normalized: ${data.battery_voltage}V`);
+            }
         }
 
     } catch (error) {
